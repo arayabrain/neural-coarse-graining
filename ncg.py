@@ -7,9 +7,6 @@ import theano.tensor as T
 
 from lasagne.utils import floatX
 
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-
 import lasagne
 from lasagne.layers import batch_norm
 import sys
@@ -17,12 +14,15 @@ import os
 
 import argparse
 
+# Stuff to load/save models
 def read_model(lastlayers, filename):
 	lasagne.layers.set_all_param_values(lastlayers, pickle.load(open(filename,"rb")))
 
 def write_model(lastlayers, filename):
 	pickle.dump( lasagne.layers.get_all_param_values(lastlayers), open(filename,"wb"))
 
+# We'll need this distributed softmax so that each point in the convolution output gets its own softmax over channels
+# The exponential is capped above and below to avoid NaNs when the network is very sure of a particular class
 def convSoftmax(x):
 	emx = T.exp(T.maximum(T.minimum(x,20),-20))
 	return emx/(1e-8 + T.sum(emx,axis=1,keepdims=True))
@@ -62,6 +62,7 @@ args = parser.parse_args()
 DISTANCE = args.dt
 CLASSES = args.classes
 
+# Load in the data, make sure it has the shape (signal length, channels)
 data = np.loadtxt(args.input)
 if data.ndim<2:
 	data = data.reshape((data.shape[0],1))
@@ -78,10 +79,12 @@ def build_model():
 	
 	net["input1"] = lasagne.layers.InputLayer(shape=(None,data.shape[1],None), input_var = invar1 )
 	
+	# Transformer part of the network - in-place convolution to transform to the new coarse-grained classes
 	net["transform1"] = batch_norm(lasagne.layers.Conv1DLayer(incoming=net["input1"], num_filters=args.tr_filt1, filter_size=args.tr_fs1, pad="same", nonlinearity=leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
 	net["transform2"] = batch_norm(lasagne.layers.Conv1DLayer(incoming=net["transform1"], num_filters=args.tr_filt2, filter_size=args.tr_fs2, pad="same", nonlinearity=leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
 	net["transform3"] = (lasagne.layers.Conv1DLayer(incoming=net["transform2"], num_filters=CLASSES, filter_size=1, pad="same", nonlinearity=convSoftmax, W = lasagne.init.GlorotUniform(gain='relu')))
 	
+	# Predictor part. Take the coarse-grained classes and predict them at an offset of DISTANCE
 	net["predictor1"] = batch_norm(lasagne.layers.Conv1DLayer(incoming = net["transform3"], num_filters = args.pr_filt1, filter_size=args.pr_fs1, pad="same", nonlinearity = leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
 	net["predictor2"] = batch_norm(lasagne.layers.Conv1DLayer(incoming = net["predictor1"], num_filters = args.pr_filt2, filter_size=args.pr_fs2, pad="same", nonlinearity = leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
 	net["predictor3"] = (lasagne.layers.Conv1DLayer(incoming = net["predictor2"], num_filters = CLASSES, filter_size=1, pad="same", nonlinearity = convSoftmax, W = lasagne.init.GlorotUniform(gain='relu')))
@@ -93,15 +96,21 @@ net = build_model()
 if args.load_model:
 	read_model(net["predictor3"], args.load_model)
 
+# We want both the transformed data and the predictions
 output,transform = lasagne.layers.get_output( (net["predictor3"], net["transform3"]) )
 params = lasagne.layers.get_all_params( (net["predictor3"]), trainable = True)
 
+# This gives us the offset transformed signal, that we want the predictor to output. Clip the ends by DISTANCE to avoid the overflow
 rtransform = T.roll(transform,-DISTANCE,axis=2)[:,:,DISTANCE:-DISTANCE]
 routput = output[:,:,DISTANCE:-DISTANCE]
 
+# Entropy term measures the entropy of the average transformed signal. We want to make this large
 entropy = -1 * (rtransform.mean(axis = (0,2)) * T.log(rtransform.mean(axis=(0,2))+1e-6)).sum()
+
+# Info term measures the error of the predictor (standard cross-entropy error between the prediction and true distribution). We want to make this small
 info = -1 * ((rtransform * T.log( routput + 1e-6 )).mean(axis=(0,2))).sum()
 
+# Combined loss function
 loss = info - entropy
 
 lr = args.lr
