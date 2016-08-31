@@ -4,6 +4,7 @@ from math import *
 import pickle
 import theano
 import theano.tensor as T
+import theano.tensor.nlinalg as TNL
 
 from lasagne.utils import floatX
 
@@ -56,6 +57,7 @@ parser.add_argument('--tr_fs1',required=False,default=3,type=int, help='Filter s
 parser.add_argument('--tr_fs2',required=False,default=3,type=int, help='Filter size of the second transformer layer')
 parser.add_argument('--pr_fs1',required=False,default=3,type=int, help='Filter size of the first predictor layer')
 parser.add_argument('--pr_fs2',required=False,default=3,type=int, help='Filter size of the second predictor layer')
+parser.add_argument('--continuous',action='store_true', help='Use continuous coarse-grained variables rather than discrete')
 
 args = parser.parse_args()
 
@@ -82,12 +84,20 @@ def build_model():
 	# Transformer part of the network - in-place convolution to transform to the new coarse-grained classes
 	net["transform1"] = batch_norm(lasagne.layers.Conv1DLayer(incoming=net["input1"], num_filters=args.tr_filt1, filter_size=args.tr_fs1, pad="same", nonlinearity=leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
 	net["transform2"] = batch_norm(lasagne.layers.Conv1DLayer(incoming=net["transform1"], num_filters=args.tr_filt2, filter_size=args.tr_fs2, pad="same", nonlinearity=leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
-	net["transform3"] = (lasagne.layers.Conv1DLayer(incoming=net["transform2"], num_filters=CLASSES, filter_size=1, pad="same", nonlinearity=convSoftmax, W = lasagne.init.GlorotUniform(gain='relu')))
+	
+	if args.continuous: # If we have continuous CG variables, use a tanh nonlinearity for output. Otherwise, use softmax to treat it as a probability distribution
+		net["transform3"] = (lasagne.layers.Conv1DLayer(incoming=net["transform2"], num_filters=CLASSES, filter_size=1, pad="same", nonlinearity=lasagne.nonlinearities.tanh, W = lasagne.init.GlorotUniform(gain='relu')))
+	else:
+		net["transform3"] = (lasagne.layers.Conv1DLayer(incoming=net["transform2"], num_filters=CLASSES, filter_size=1, pad="same", nonlinearity=convSoftmax, W = lasagne.init.GlorotUniform(gain='relu')))
 	
 	# Predictor part. Take the coarse-grained classes and predict them at an offset of DISTANCE
 	net["predictor1"] = batch_norm(lasagne.layers.Conv1DLayer(incoming = net["transform3"], num_filters = args.pr_filt1, filter_size=args.pr_fs1, pad="same", nonlinearity = leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
 	net["predictor2"] = batch_norm(lasagne.layers.Conv1DLayer(incoming = net["predictor1"], num_filters = args.pr_filt2, filter_size=args.pr_fs2, pad="same", nonlinearity = leakyReLU, W = lasagne.init.GlorotUniform(gain='relu')))
-	net["predictor3"] = (lasagne.layers.Conv1DLayer(incoming = net["predictor2"], num_filters = CLASSES, filter_size=1, pad="same", nonlinearity = convSoftmax, W = lasagne.init.GlorotUniform(gain='relu')))
+	
+	if args.continuous: # If we have continuous CG variables, use a tanh nonlinearity for output. Otherwise, use softmax to treat it as a probability distribution
+		net["predictor3"] = (lasagne.layers.Conv1DLayer(incoming = net["predictor2"], num_filters = CLASSES, filter_size=1, pad="same", nonlinearity = lasagne.nonlinearities.tanh, W = lasagne.init.GlorotUniform(gain='relu')))
+	else:
+		net["predictor3"] = (lasagne.layers.Conv1DLayer(incoming = net["predictor2"], num_filters = CLASSES, filter_size=1, pad="same", nonlinearity = convSoftmax, W = lasagne.init.GlorotUniform(gain='relu')))
 
 	return net
 
@@ -104,11 +114,35 @@ params = lasagne.layers.get_all_params( (net["predictor3"]), trainable = True)
 rtransform = T.roll(transform,-DISTANCE,axis=2)[:,:,DISTANCE:-DISTANCE]
 routput = output[:,:,DISTANCE:-DISTANCE]
 
-# Entropy term measures the entropy of the average transformed signal. We want to make this large
-entropy = -1 * (rtransform.mean(axis = (0,2)) * T.log(rtransform.mean(axis=(0,2))+1e-6)).sum()
+if args.continuous:
+	# Continuous loss function uses the determinant of the covariance matrix for the signal and residual
+	residual = rtransform-routput
 
-# Info term measures the error of the predictor (standard cross-entropy error between the prediction and true distribution). We want to make this small
-info = -1 * ((rtransform * T.log( routput + 1e-6 )).mean(axis=(0,2))).sum()
+	# For covariance, we want to subtract out the means...
+	sigmean = rtransform.mean(axis=(0,2), keepdims=True)
+	epsmean = residual.mean(axis=(0,2), keepdims=True)
+	
+	rtdelta = rtransform - sigmean
+	epsdelta = residual - epsmean
+	
+	# Covariance matrices
+	sig_cov = T.tensordot( rtdelta, rtdelta, axes=((0,2),(0,2))) / (rtransform.shape[0]*rtransform.shape[2])
+	eps_cov = T.tensordot( epsdelta, epsdelta, axes=((0,2),(0,2))) / (residual.shape[0]*residual.shape[2])
+	
+	det_sig = TNL.Det()(sig_cov) + 1e-48
+	det_eps = TNL.Det()(eps_cov) + 1e-48
+
+	entropy = T.log(det_sig)
+	info = T.log(det_eps)
+
+	# First two terms gives the entropy contrast, but we'd also like the predictions to be correct (as opposed to constant offset), so we add a third term to encourage the mean residual to be zero.
+	loss = info - entropy + 1e-2 * (epsmean**2).mean()
+else:
+	# Entropy term measures the entropy of the average transformed signal. We want to make this large
+	entropy = -1 * (rtransform.mean(axis = (0,2)) * T.log(rtransform.mean(axis=(0,2))+1e-6)).sum()
+
+	# Info term measures the error of the predictor (standard cross-entropy error between the prediction and true distribution). We want to make this small
+	info = -1 * ((rtransform * T.log( routput + 1e-6 )).mean(axis=(0,2))).sum()
 
 # Combined loss function
 loss = info - entropy
